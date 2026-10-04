@@ -3,15 +3,18 @@ import backendInfo from '../api/backend-info';
 import axios, { AxiosResponse } from 'axios';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import * as https from 'https';
+import { Common } from '../api/common';
+import logger from '../logger';
 
 /** @asyncSafe */
 export async function $sync(path, sanityCheckCb?: (results: any, path: string) => any): Promise<{ data?: any, exists: boolean, server?: string }> {
   // start with a random server so load is uniformly spread
   let allMissing = true;
-  const offset = Math.floor(Math.random() * config.REPLICATION.SERVERS.length);
   const results: any[] = [];
-  for (let i = 0; i < config.REPLICATION.SERVERS.length; i++) {
-    const server = config.REPLICATION.SERVERS[(i + offset) % config.REPLICATION.SERVERS.length];
+  const respondedServers: string[] = [];
+  const servers = [...config.REPLICATION.SERVERS];
+  Common.shuffleArray(servers);
+  for (const server of servers) {
     // don't query ourself
     if (server === backendInfo.getBackendInfo().hostname) {
       continue;
@@ -20,12 +23,19 @@ export async function $sync(path, sanityCheckCb?: (results: any, path: string) =
     try {
       const result = await query(`https://${server}${path}`);
       if (result) {
-        if (sanityCheckCb !== undefined && results.length >= 3) {
-          results.push(result);
-          const sanitizedResult = sanityCheckCb(results, path);
-          return { data: sanitizedResult, exists: true, server };
-        } else {
+        if (sanityCheckCb === undefined) {
           return { data: result, exists: true, server };
+        }
+        results.push(result);
+        respondedServers.push(server);
+        if (results.length >= 4) {
+          const sanitizedResult = sanityCheckCb(results, path);
+          if (sanitizedResult.length > 0) {
+            return { data: sanitizedResult, exists: true, server: respondedServers[results.indexOf(sanitizedResult)] };
+          } else {
+            results.length = 0;
+            respondedServers.length = 0;
+          }
         }
       }
     } catch (e: any) {
@@ -36,6 +46,10 @@ export async function $sync(path, sanityCheckCb?: (results: any, path: string) =
         allMissing = false;
       }
     }
+  }
+
+  if (sanityCheckCb !== undefined && results.length > 0) {
+    logger.warn(`Only ${results.length} trusted servers responded to ${path} without agreement, skipping`, 'Replication');
   }
 
   return { exists: !allMissing };
@@ -76,40 +90,4 @@ export async function query(path): Promise<object> {
     throw new Error(`${data.status}`);
   }
   return data.data;
-}
-
-function performSanityCheck(results: any[], type: 'audits' | 'statistics', interval?: any): any[] {
-  if (results.length === 0) {
-    return [];
-  }
-  const finalResult: any[] = [];
-  let tempResult: any[] = [];
-  if (type === 'statistics') {
-    for (const res of results) {
-      if (tempResult.length === 0) {
-        tempResult = [...res];
-        continue;
-      }
-
-      for (const [key, value] of Object.entries(res)) {
-        if (typeof value !== 'number') {
-          continue;
-        }
-
-        const tmpValue = tempResult[key];
-        const absDelta = Math.abs(tmpValue - value);
-
-        let healthyResult = true;
-        if (key === '' && absDelta > value * 0.1) {
-          healthyResult = false;
-        }
-      }
-    }
-  }
-
-  if (type === 'audits') {
-
-  }
-
-  return results[0];
 }

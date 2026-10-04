@@ -26,6 +26,11 @@ const steps = {
   'all': 43200,
 };
 
+const MAX_EMPTINESS = 0.1;
+const MAX_POLLUTION = 0.1;
+const MAX_DEVIATION = 0.1;
+const VSIZES_LENGTH = 39;
+
 /**
  * Syncs missing statistics data from trusted servers
  */
@@ -82,7 +87,7 @@ class StatisticsReplication {
     let success = false;
     let synced = 0;
     const missed = new Set(missingTimes);
-    const syncResult = await $sync(`/api/v1/statistics/${interval}`, this.performSanityCheck);
+    const syncResult = await $sync(`/api/v1/statistics/${interval}`, this.performSanityCheck.bind(this));
     if (syncResult && syncResult.data?.length) {
       success = true;
       logger.info(`Fetched /api/v1/statistics/${interval} from ${syncResult.server}`);
@@ -108,6 +113,14 @@ class StatisticsReplication {
     return { success, synced, missed: missed.size };
   }
 
+  /**
+   * Iterates over the list of results from trusted servers and compares each result against the others
+   * to make sure their responses don't vary too much
+   *
+   * @param results a list of responses from different servers
+   * @param path the path of the endpoint gotten, used to get its timespan parameter
+   * @returns the healthiest result
+   */
   private performSanityCheck(results: OptimizedStatistic[][], path: string) {
     if (results.length === 0) {
       return [];
@@ -115,6 +128,12 @@ class StatisticsReplication {
 
     const routes = path.split('/');
     const interval = routes[routes.length - 1];
+    const step = steps[interval];
+
+    const slottedResults: Map<number, OptimizedStatistic>[] = [];
+    for (const result of results) {
+      slottedResults.push(Array.isArray(result) ? this.mapBySlot(result, step) : new Map());
+    }
 
     const alreadyScanned: Record<string, boolean> = {};
     const sanityResults: Record<string, boolean> = {};
@@ -137,61 +156,110 @@ class StatisticsReplication {
           continue;
         }
 
-        const stats1 = results[i] ?? [];
-        const stats2 = results[j] ?? [];
-        const maxLength = Math.min(stats1.length, stats2.length);
-        const pollutionThreshold = Math.floor(maxLength * 0.1);
-        let pollutionCounter = 0;
-        const healthy = (): boolean => pollutionCounter <= pollutionThreshold;
+        const slots1 = slottedResults[i];
+        const slots2 = slottedResults[j];
+        const shortest = Math.min(slots1.size, slots2.size);
+        const longest = Math.max(slots1.size, slots2.size);
+        const percentageEmptiness = (longest - shortest) / longest;
 
-        for (let index = 0; index < maxLength; index++) {
-          if (!healthy()) {
+        if (percentageEmptiness > MAX_EMPTINESS) {
+          sanityResults[checksKey] = false;
+          alreadyScanned[checksKey] = true;
+          continue;
+        }
+
+        const sharedSlots: [OptimizedStatistic, OptimizedStatistic][] = [];
+        for (const [slot, stat1] of slots1) {
+          const stat2 = slots2.get(slot);
+          if (stat2) {
+            sharedSlots.push([stat1, stat2]);
+          }
+        }
+
+        if (sharedSlots.length === 0) {
+          sanityResults[checksKey] = false;
+          alreadyScanned[checksKey] = true;
+          continue;
+        }
+
+        const pollutionThreshold = Math.floor(sharedSlots.length * MAX_POLLUTION);
+        let pollutionCounter = 0;
+
+        for (const [stat1, stat2] of sharedSlots) {
+          if (pollutionCounter > pollutionThreshold) {
             break;
           }
-          const stat1 = stats1[index];
-          const stat2 = stats2[index];
 
           for (const key of Object.keys(stat1)) {
             const value1 = stat1[key];
             const value2 = stat2[key];
 
-            if (key === 'added') { // both timestamps are in the same slot
-              const step = steps[interval];
-              const slot1 = Math.floor(value1 / step) * step;
-              const slot2 = Math.floor(value2 / step) * step;
-              if (slot1 !== slot2) {
-                pollutionCounter++;
-              }
-            }
-
-            if (key === 'count') { // tx count diff can't be greater than 10%
+            if (key === 'count') {
               const absDelta = Math.abs(value1 - value2);
-              if (absDelta > value1 * 0.1) {
+              if (absDelta > Math.max(value1, value2) * MAX_DEVIATION) {
                 pollutionCounter++;
               }
+              continue;
             }
 
-            if (key === 'vsizes') { // none of the vsizes diff can't be greater than 10%
-              for (const [vsize1, vsize2] of [value1, value2]) {
-                const absDelta = Math.abs(vsize1 - vsize2);
-                if (absDelta > vsize1 * 0.1) {
-                  pollutionCounter++;
-                }
+            if (key === 'vsizes') {
+              if (value1.length !== VSIZES_LENGTH || value2.length !== VSIZES_LENGTH) {
+                pollutionCounter++;
+                continue;
               }
-            }
 
-            if (key === 'min_fee') {
-              if (value1 !== value2) { // this is a config so it should be equal across servers
+              const sum1 = value1.reduce((acc, val) => acc + val, 0);
+              const sum2 = value2.reduce((acc, val) => acc + val, 0);
+
+              const absDelta = Math.abs(sum1 - sum2);
+              if (absDelta > Math.max(sum1, sum2) * MAX_DEVIATION) {
                 pollutionCounter++;
               }
+              continue;
             }
           }
         }
 
-        sanityResults[checksKey] = healthy();
+        sanityResults[checksKey] = pollutionCounter <= pollutionThreshold;
         alreadyScanned[checksKey] = true;
       }
     }
+
+    const candidates: Record<number, number> = {};
+    for (const [key, result] of Object.entries(sanityResults)) {
+      const [i, j] = key.split('-');
+
+      if (result) {
+        if (!candidates[i]) {
+          candidates[i] = 0;
+        }
+        if (!candidates[j]) {
+          candidates[j] = 0;
+        }
+        candidates[i]++;
+        candidates[j]++;
+      }
+    }
+
+    let bestCandidateIndex: number;
+    try {
+      bestCandidateIndex = Number(Object.keys(candidates).reduce((a, b) => candidates[a] > candidates[b] ? a : b));
+    } catch {
+      return [];
+    }
+
+    return results[bestCandidateIndex];
+  }
+
+  private mapBySlot(stats: OptimizedStatistic[], step: number) {
+    const slots = new Map<number, OptimizedStatistic>();
+    for (const stat of stats) {
+      const slot = this.roundToNearestStep(Number(stat.added), step);
+      if (!slots.has(slot)) {
+        slots.set(slot, stat);
+      }
+    }
+    return slots;
   }
 
   
